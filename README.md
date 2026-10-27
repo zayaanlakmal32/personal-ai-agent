@@ -8,7 +8,7 @@ A private AI assistant on Telegram that manages my email, calendar, reminders an
 - **Voice notes:** English, Sinhala or Singlish, shown as a transcript and then answered
 - **Photos and PDFs:** reads receipts, documents and screenshots, and acts on the caption
 - **Makes PDFs:** "send me a PDF of…" produces a formatted PDF, sent in the chat (Cloudflare Browser Run, Sinhala supported)
-- **Images:** generates pictures from text (FLUX on Workers AI, free) and edits your photos or the last image it made
+- **Images:** generates pictures from text and edits your photos or the last image it made. Quality modes: normal (FLUX.2 klein 4B, ~95/day), HD (klein 9B, ~7/day) and poster with readable text (Leonardo Lucid Origin, ~3/day). Includes a prompt enhancer and a daily budget guard.
 - **Deep thinking:** hands complex questions to a stronger Gemini model
 - **Long chats:** older messages are summarised automatically, so context isn't lost
 - **Action receipts:** every real action adds a code-written ✅/⏰ line, so the AI can't fake it
@@ -100,3 +100,4 @@ Anything else is plain chat, for example "any important emails today?", "remind 
 5. Web search (Tavily), plus job scanning, scoring, tracking and weekly digest
 6. Voice notes, photo and PDF reading, automatic long-term memory, PDF creation, and action receipts
 7. Image generation and editing, deep thinking, and long-chat summaries
+8. Image quality modes, prompt enhancer, budget guard, and the "said but didn't do" check for images

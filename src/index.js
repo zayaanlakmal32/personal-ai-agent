@@ -285,6 +285,7 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
         const input = await mediaToText(env, chatId, media, (msg.caption || "").trim());
         userText = input.userText;
         opts.storedText = input.storedText;
+        opts.intentText = (msg.caption || "").trim();
         opts.extraLog = input.extraLog;
       }
       reply = await runAgent(env, userText, pending, timeLimitMs, opts);
@@ -341,8 +342,8 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
   const toolLog = opts.extraLog ? [opts.extraLog] : [];
   const receipts = [];      // proof lines written by the code, not the AI
   const usedTools = new Set();
-  let forceReminder = false;
-  let checkedReminder = false;
+  let forceTools = null;           // tools the AI must call next (safety check)
+  const checked = new Set();
   let finalText = null;
 
   for (let step = 0; step < 8; step++) {
@@ -354,10 +355,10 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
     }
     let data;
     try {
-      const toolConfig = forceReminder
-        ? { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["set_reminder", "list_reminders", "cancel_reminder"] } }
+      const toolConfig = forceTools
+        ? { functionCallingConfig: { mode: "ANY", allowedFunctionNames: forceTools } }
         : null;
-      forceReminder = false;
+      forceTools = null;
       data = await callGemini(env, systemPrompt, contents, Math.min(timeLeft, 120000), true, null, toolConfig);
     } catch (e) {
       if (e.name === "TimeoutError" || e.name === "AbortError") {
@@ -375,16 +376,15 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
     if (calls.length === 0) {
       finalText = content.parts.map((p) => p.text || "").join("").trim();
 
-      // Safety check: he asked for a reminder, but the AI only talked about it
-      const reminderTools = ["set_reminder", "list_reminders", "cancel_reminder"];
-      if (!checkedReminder && REMINDER_INTENT.test(userText) &&
-          !reminderTools.some((t) => usedTools.has(t)) && !/[?？]\s*$/.test(finalText)) {
-        checkedReminder = true;
-        forceReminder = true;
+      // Safety check: he asked for something, but the AI only talked about it
+      const intentText = opts.intentText ?? userText;
+      const missed = ACTION_CHECKS.find((c) => !checked.has(c.name) && c.intent.test(intentText) &&
+        !c.tools.some((t) => usedTools.has(t)) && !/[?？]\s*$/.test(finalText));
+      if (missed) {
+        checked.add(missed.name);
+        forceTools = missed.tools;
         finalText = null;
-        contents.push({ role: "user", parts: [{ text:
-          "[System check: no reminder tool was called, so no reminder exists yet. Call the correct reminder tool now. " +
-          "Use in_minutes for relative times.]" }] });
+        contents.push({ role: "user", parts: [{ text: missed.nudge }] });
         continue;
       }
       break;
@@ -520,7 +520,9 @@ Reminders and daily brief:
 - The daily brief is currently set to: ${briefTime === "off" ? "off" : briefTime}. Use set_daily_brief to change the time or turn it off.
 
 Images:
-- Use generate_image when he asks for a picture, image, drawing, logo idea, poster, etc. Write a detailed English prompt (subject, style, lighting, colours, composition), even if he asked in Sinhala.
+- Use generate_image when he asks for a picture, image, drawing, logo idea, poster, etc. Describe what he wants in English, even if he asked in Sinhala. The prompt is improved automatically.
+- quality: "normal" by default. "hd" when he asks for HD, high quality, or a realistic photo. "poster" when the image must contain words (posters, thumbnails, logos with names). Put the exact words in quotes in the prompt.
+- HD and poster use much more of the free daily allowance (about 7 HD or 3 poster images a day). If the tool says it fell back to normal, tell him briefly.
 - Use edit_image to change the last photo he sent or the last image you made ("make it darker", "put this in anime style", "change the background to a beach").
 - For "try again" or "another one", call generate_image again with a varied prompt.
 - The image is sent to him directly. Afterwards just add a short line, no need to describe it at length.
@@ -713,8 +715,9 @@ const TOOLS = [{
       parameters: {
         type: "object",
         properties: {
-          prompt: { type: "string", description: "Detailed English description of the image" },
+          prompt: { type: "string", description: "English description of the image. Put any words that must appear in quotes." },
           shape: { type: "string", enum: ["square", "landscape", "portrait"], description: "Default square" },
+          quality: { type: "string", enum: ["normal", "hd", "poster"], description: "normal (default), hd (sharper, realistic), poster (needs readable text)" },
         },
         required: ["prompt"],
       },
@@ -1196,6 +1199,23 @@ Never invent anything. Only use the data given. Keep it short and easy to scan.`
 
 // Words that mean "remind me" in English, Sinhala and Singlish
 const REMINDER_INTENT = /remind|reminder|alarm|මතක්\s*කර|මතක්\s*කරන්න|මතක්\s*කරලා|mathak\s*kara|mathak\s*karanna|mathak\s*karala/i;
+// Asking for a picture to be made or changed (English, Sinhala, Singlish)
+const IMAGE_INTENT = /\b(make|create|generate|draw|design|edit|change|turn|redo|another|again|give me|show me|hd)\b.{0,40}\b(image|picture|pic|photo|poster|logo|wallpaper|drawing|illustration|thumbnail)s?\b|\b(image|picture|pic|poster|logo|wallpaper|drawing|thumbnail)s?\s+(of|for|with)\b|\bmake it (darker|brighter|lighter|hd|realistic|anime|cartoon|black and white)|පින්තූර|ඡායාරූප|pinthura|pinthure|photo\s*ekak/i;
+
+const ACTION_CHECKS = [
+  {
+    name: "reminder",
+    intent: REMINDER_INTENT,
+    tools: ["set_reminder", "list_reminders", "cancel_reminder"],
+    nudge: "[System check: no reminder tool was called, so no reminder exists yet. Call the correct reminder tool now. Use in_minutes for relative times.]",
+  },
+  {
+    name: "image",
+    intent: IMAGE_INTENT,
+    tools: ["generate_image", "edit_image"],
+    nudge: "[System check: no image was made. If he wants a new picture call generate_image; if he wants to change the last photo or image call edit_image. Do it now.]",
+  },
+];
 
 function receiptFor(name, args, r) {
   switch (name) {
@@ -1227,7 +1247,7 @@ function receiptFor(name, args, r) {
     case "make_pdf":
       return `📄 PDF sent: ${r.filename}`;
     case "generate_image":
-      return "🎨 Image sent";
+      return `🎨 Image sent · ${r.quality_used}${r.fell_back ? " (" + r.fell_back + ")" : ""}`;
     case "edit_image":
       return "🖌 Edited image sent";
     case "deep_think":
@@ -1392,14 +1412,39 @@ Write each fact as a short sentence starting with "Zayaan" or naming the person.
 
 // ---------- Images (Cloudflare Workers AI) ----------
 
-const IMAGE_MODEL = "@cf/black-forest-labs/flux-2-klein-4b";
-const IMAGE_FALLBACK_MODEL = "@cf/black-forest-labs/flux-1-schnell";
+const MODELS = {
+  normal: "@cf/black-forest-labs/flux-2-klein-4b",
+  hd: "@cf/black-forest-labs/flux-2-klein-9b",
+  poster: "@cf/leonardo/lucid-origin",
+  backup: "@cf/black-forest-labs/flux-1-schnell",
+};
 const SHAPES = { square: [1024, 1024], landscape: [1280, 768], portrait: [768, 1280] };
+const DAILY_NEURONS = 10000;   // Workers AI free allowance, resets 00:00 UTC (5:30am Sri Lanka)
+const NEURON_RESERVE = 400;    // keep a little spare so normal images keep working
 
 // Editing needs a photo under 512x512, so pick the biggest Telegram size that fits
 function editableSize(sizes) {
   const fits = sizes.filter((p) => (p.width || 0) < 512 && (p.height || 0) < 512);
   return (fits.length ? fits[fits.length - 1] : sizes[0]).file_id;
+}
+
+// Rough cost estimates from Cloudflare's pricing page
+function estimateNeurons(quality, w, h, editing) {
+  const tiles = Math.ceil(w / 512) * Math.ceil(h / 512);
+  const mp = (w * h) / (1024 * 1024);
+  if (quality === "hd") return Math.ceil(1363.64 + Math.max(0, mp - 1) * 181.82);
+  if (quality === "poster") return Math.ceil(tiles * 636 + 25 * 12);
+  return Math.ceil(tiles * 26.05 + (editing ? 5.37 : 0));
+}
+
+async function neuronsUsedToday(env) {
+  const key = "neurons_" + new Date().toISOString().slice(0, 10);
+  return { key, used: Number((await getSetting(env, key)) || 0) };
+}
+
+async function addNeurons(env, n) {
+  const { key, used } = await neuronsUsedToday(env);
+  await setSetting(env, key, used + n);
 }
 
 async function aiImageToBytes(resp) {
@@ -1415,24 +1460,35 @@ async function aiImageToBytes(resp) {
   throw new Error("Unexpected image response from the model.");
 }
 
-async function runImageModel(env, prompt, width, height, inputImage) {
+async function runImageModel(env, quality, prompt, width, height, inputImage) {
   if (!env.AI) throw new Error("Image making isn't set up yet. Add a Workers AI binding named AI in Cloudflare.");
+  if (quality === "poster") {
+    const resp = await env.AI.run(MODELS.poster, { prompt, width, height, num_steps: 25, guidance: 4.5 });
+    return await aiImageToBytes(resp);
+  }
   const form = new FormData();
   form.append("prompt", prompt);
   form.append("width", String(width));
   form.append("height", String(height));
   if (inputImage) form.append("input_image_0", new Blob([inputImage], { type: "image/jpeg" }));
   const req = new Response(form);
+  const resp = await env.AI.run(quality === "hd" ? MODELS.hd : MODELS.normal, {
+    multipart: { body: req.body, contentType: req.headers.get("content-type") },
+  });
+  return await aiImageToBytes(resp);
+}
+
+// Turn a short request into a detailed, professional image prompt
+async function enhancePrompt(env, prompt, quality) {
   try {
-    const resp = await env.AI.run(IMAGE_MODEL, {
-      multipart: { body: req.body, contentType: req.headers.get("content-type") },
-    });
-    return await aiImageToBytes(resp);
+    const system = `You write prompts for an AI image model. Rewrite the request into one detailed English prompt (60-120 words):
+subject and action, setting, composition and camera angle, lighting, colour palette, mood, style or medium, and fine details.
+${quality === "poster" ? "Any words that must appear go in double quotes, spelled exactly, and say where they go (e.g. large bold title at the top)." : "Do not add any text, letters, signs or logos unless asked."}
+Keep every detail the person asked for. Don't add people or objects that change the meaning. Output only the prompt.`;
+    const better = await geminiText(env, system, [{ text: prompt }], 30000);
+    return better && better.length > 20 ? better.slice(0, 2000) : prompt;
   } catch (e) {
-    if (inputImage) throw e; // no fallback for editing
-    // Fallback: older, simpler model for text-to-image
-    const resp = await env.AI.run(IMAGE_FALLBACK_MODEL, { prompt, steps: 4 });
-    return await aiImageToBytes(resp);
+    return prompt; // use the original if this step fails
   }
 }
 
@@ -1450,21 +1506,59 @@ async function sendPhotoBytes(env, bytes, caption) {
 
 function aiLimitError(e) {
   const m = String(e.message || e);
-  if (/neuron|limit|quota|429|capacity/i.test(m)) {
-    return new Error("Today's free image limit is used up (it resets at 5:30am Sri Lanka time). Try again tomorrow.");
+  if (/neuron|limit|quota|429|capacity|exceeded/i.test(m)) {
+    return new Error("Today's free image allowance is used up (it resets at 5:30am Sri Lanka time).");
   }
   return e;
 }
 
 async function generateImage(env, args) {
   const [w, h] = SHAPES[args.shape] || SHAPES.square;
-  try {
-    const bytes = await runImageModel(env, args.prompt, w, h, null);
-    await sendPhotoBytes(env, bytes, null);
-  } catch (e) {
-    throw aiLimitError(e);
+  let quality = ["hd", "poster"].includes(args.quality) ? args.quality : "normal";
+  let fellBack = "";
+
+  // Budget guard: drop to normal if HD/poster would use up the day's allowance
+  const { used } = await neuronsUsedToday(env);
+  if (quality !== "normal" && used + estimateNeurons(quality, w, h) > DAILY_NEURONS - NEURON_RESERVE) {
+    fellBack = `not enough free ${quality} allowance left today, used normal`;
+    quality = "normal";
   }
-  return { sent: true, prompt: args.prompt };
+
+  const prompt = await enhancePrompt(env, args.prompt, quality);
+  let bytes;
+  try {
+    bytes = await runImageModel(env, quality, prompt, w, h, null);
+  } catch (e) {
+    if (quality !== "normal") {
+      // Better model failed: try normal
+      fellBack = `${quality} model failed (${String(e.message).slice(0, 80)}), used normal`;
+      quality = "normal";
+      try {
+        bytes = await runImageModel(env, "normal", prompt, w, h, null);
+      } catch (e2) {
+        throw aiLimitError(e2);
+      }
+    } else {
+      try {
+        // Last resort: older model
+        bytes = await aiImageToBytes(await env.AI.run(MODELS.backup, { prompt: prompt.slice(0, 2000), steps: 4 }));
+        quality = "backup";
+      } catch (e2) {
+        throw aiLimitError(e);
+      }
+    }
+  }
+  await addNeurons(env, estimateNeurons(quality === "backup" ? "normal" : quality, w, h));
+  await sendPhotoBytes(env, bytes, null);
+
+  const after = (await neuronsUsedToday(env)).used;
+  return {
+    sent: true,
+    quality_used: quality,
+    fell_back: fellBack || null,
+    approx_hd_left_today: Math.max(0, Math.floor((DAILY_NEURONS - NEURON_RESERVE - after) / estimateNeurons("hd", 1024, 1024))),
+    approx_poster_left_today: Math.max(0, Math.floor((DAILY_NEURONS - NEURON_RESERVE - after) / estimateNeurons("poster", 1024, 1024))),
+  };
 }
 
 async function editImage(env, args) {
@@ -1474,8 +1568,9 @@ async function editImage(env, args) {
   const bin = atob(b64);
   const input = Uint8Array.from(bin, (c) => c.charCodeAt(0));
   try {
-    const bytes = await runImageModel(env,
+    const bytes = await runImageModel(env, "normal",
       `Edit image 0: ${args.instruction}. Keep everything else the same as image 0.`, 1024, 1024, input);
+    await addNeurons(env, estimateNeurons("normal", 1024, 1024, true));
     await sendPhotoBytes(env, bytes, null);
   } catch (e) {
     throw aiLimitError(e);
