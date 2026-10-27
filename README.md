@@ -4,7 +4,9 @@ A private AI assistant on Telegram that manages my email, calendar, reminders an
 
 ## What it does
 
-- **Chat with memory:** remembers facts, tasks and notes between conversations
+- **Chat with memory:** remembers facts, tasks and notes between conversations, and automatically picks up lasting facts from chats
+- **Voice notes:** English, Sinhala or Singlish, shown as a transcript and then answered
+- **Photos and PDFs:** reads receipts, documents and screenshots, and acts on the caption
 - **Gmail:** analyses up to 200 emails at once, reads, drafts, and sends only after I tap Confirm
 - **Google Calendar:** checks my schedule, and creates or deletes events only after I tap Confirm
 - **Reminders:** one-off, daily or weekly, delivered on time
@@ -88,3 +90,4 @@ Anything else is plain chat, for example "any important emails today?", "remind 
 3. Gmail + Calendar with confirm buttons, batch email fetching, and follow-up context
 4. Queue for long jobs, plus reminders and a daily brief (cron)
 5. Web search (Tavily), plus job scanning, scoring, tracking and weekly digest
+6. Voice notes, photo and PDF reading, and automatic long-term memory

@@ -1,5 +1,5 @@
-// Personal AI Agent — Step 5: web search + job hunting
-// Includes memory, tasks, notes, Gmail, Calendar, queue, reminders, daily brief
+// Personal AI Agent — Step 6: voice notes, photos/PDFs, smarter memory
+// Includes memory, tasks, notes, Gmail, Calendar, queue, reminders, daily brief, web search, jobs
 
 const TZ = "Asia/Colombo";
 const TZ_OFFSET = "+05:30";
@@ -132,9 +132,11 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
   }
 
   const msg = update.message;
-  if (!msg || !msg.text) return;
+  if (!msg) return;
+  const media = getMedia(msg);
+  if (!msg.text && !media) return;
   const chatId = msg.chat.id;
-  const text = msg.text.trim();
+  const text = (msg.text || "").trim();
 
   if (String(msg.from.id) !== String(env.ALLOWED_USER_ID)) {
     await sendText(env, chatId, "Sorry, this is a private bot.");
@@ -145,7 +147,7 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
     if (text === "/start") {
       await sendText(env, chatId,
         "Hey Zayaan! I'm your personal agent.\n\n" +
-        "Just talk to me normally. I can remember facts, manage tasks and notes, set reminders, send a daily brief, read your Gmail and manage your Google Calendar.\n\n" +
+        "Just talk to me normally, or send voice notes, photos and PDFs. I can remember things, manage tasks and notes, set reminders, send a daily brief, read your Gmail, manage your Calendar, search the web and help with your job hunt.\n\n" +
         "Commands:\n/tasks - open tasks\n/notes - recent notes\n/memory - what I know about you\n/forget - clear chat history\n" +
         "/reminders - upcoming reminders\n/brief - your daily brief now\n" +
         "/jobs - saved job matches\n/applications - jobs you applied to\n/scan_jobs - check job alert emails now\n" +
@@ -271,14 +273,26 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
     }, 4500);
 
     let reply;
+    let userText = text;
     const pending = [];
+    const opts = {};
     try {
-      reply = await runAgent(env, text, pending, timeLimitMs);
+      // Voice notes, photos and files become text first
+      if (media) {
+        const input = await mediaToText(env, chatId, media, (msg.caption || "").trim());
+        userText = input.userText;
+        opts.storedText = input.storedText;
+        opts.extraLog = input.extraLog;
+      }
+      reply = await runAgent(env, userText, pending, timeLimitMs, opts);
     } finally {
       clearInterval(typing);
     }
     await sendText(env, chatId, reply);
     for (const p of pending) await sendConfirmation(env, chatId, p);
+
+    // Afterwards, quietly pick up lasting facts from this chat
+    await autoMemory(env, chatId, opts.storedText || userText, reply);
   } catch (err) {
     await sendText(env, chatId, "Something went wrong: " + err.message);
   }
@@ -286,7 +300,7 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
 
 // ---------- The agent ----------
 
-async function runAgent(env, userText, pending, timeLimitMs = 50000) {
+async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) {
   const db = env.DB;
 
   const facts = (await db.prepare("SELECT id, fact FROM facts ORDER BY id").all()).results;
@@ -300,7 +314,7 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000) {
   ).all()).results.reverse();
   const startedAt = Date.now();
 
-  await db.prepare("INSERT INTO messages (role, content) VALUES ('user', ?)").bind(userText).run();
+  await db.prepare("INSERT INTO messages (role, content) VALUES ('user', ?)").bind(opts.storedText || userText).run();
 
   // Merge back-to-back messages from the same side (e.g. reminders, briefs)
   const contents = [];
@@ -314,7 +328,7 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000) {
   const jobPrefs = (await getSetting(env, "job_preferences")) || DEFAULT_JOB_PREFS;
   const digest = (await getSetting(env, "job_digest")) || DEFAULT_JOB_DIGEST;
   const systemPrompt = buildSystemPrompt(facts, recentData, briefTime, jobPrefs, digest);
-  const toolLog = [];
+  const toolLog = opts.extraLog ? [opts.extraLog] : [];
   let finalText = null;
 
   for (let step = 0; step < 8; step++) {
@@ -422,6 +436,8 @@ function buildSystemPrompt(facts, recentData = [], briefTime = DEFAULT_BRIEF_TIM
 
   return `You are Zayaan's personal AI assistant, chatting with him on Telegram.
 Be friendly, clear and to the point. Use plain text only, no markdown symbols like * or #.
+Reply in the language Zayaan uses: English, Sinhala, or Singlish (Sinhala in English letters).
+He can send voice notes (you get the transcript), photos and PDFs (you get their content as text). Use that content to do what he asks.
 Current date and time in Sri Lanka: ${now} (today is ${localNow().date}). All times are Sri Lanka time.
 
 Facts you have saved about Zayaan (id in brackets):
@@ -1069,6 +1085,157 @@ Never invent anything. Only use the data given. Keep it short and easy to scan.`
     let saved = JSON.stringify({ question: "daily brief", data: logData });
     if (saved.length > 32000) saved = saved.slice(0, 32000) + "...(cut off)";
     await env.DB.prepare("INSERT INTO tool_log (content) VALUES (?)").bind(saved).run();
+  }
+}
+
+// ---------- Voice notes, photos and files ----------
+
+const MAX_FILE_BYTES = 20 * 1024 * 1024; // Telegram bot download limit
+
+function getMedia(msg) {
+  if (msg.voice) return { kind: "voice", file_id: msg.voice.file_id, mime: msg.voice.mime_type || "audio/ogg", size: msg.voice.file_size };
+  if (msg.audio) return { kind: "voice", file_id: msg.audio.file_id, mime: msg.audio.mime_type || "audio/mpeg", size: msg.audio.file_size, name: msg.audio.file_name };
+  if (msg.photo?.length) {
+    const p = msg.photo[msg.photo.length - 1]; // largest size
+    return { kind: "photo", file_id: p.file_id, mime: "image/jpeg", size: p.file_size };
+  }
+  if (msg.document) {
+    const d = msg.document;
+    const mime = d.mime_type || "";
+    const ok = mime === "application/pdf" || mime.startsWith("image/") || mime.startsWith("text/") || mime.startsWith("audio/");
+    return {
+      kind: mime.startsWith("audio/") ? "voice" : mime === "application/pdf" ? "PDF" : mime.startsWith("image/") ? "photo" : "file",
+      file_id: d.file_id, mime, size: d.file_size, name: d.file_name, unsupported: !ok,
+    };
+  }
+  return null;
+}
+
+async function downloadTelegramFile(env, media) {
+  if (media.unsupported) throw new Error(`I can't read this type of file (${media.name || media.mime}). Send a PDF, image, text file or voice note.`);
+  if (media.size && media.size > MAX_FILE_BYTES) throw new Error("That file is too big. Telegram lets bots download files up to 20 MB.");
+  const info = await (await tg(env, "getFile", { file_id: media.file_id })).json();
+  if (!info.ok) throw new Error(info.description || "Couldn't get the file from Telegram.");
+  const res = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_TOKEN}/${info.result.file_path}`);
+  if (!res.ok) throw new Error(`Couldn't download the file (${res.status}).`);
+  return arrayBufferToBase64(await res.arrayBuffer());
+}
+
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+async function geminiText(env, system, parts, timeoutMs = 120000) {
+  const res = await callGemini(env, system, [{ role: "user", parts }], timeoutMs, false);
+  return (res.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+}
+
+async function mediaToText(env, chatId, media, caption) {
+  const data = await downloadTelegramFile(env, media);
+  const filePart = { inline_data: { mime_type: media.mime, data } };
+
+  if (media.kind === "voice") {
+    const transcript = await geminiText(env,
+      "Transcribe this voice message exactly. It may be in English, Sinhala, or a mix. Write Sinhala words in Sinhala script " +
+      "and English words in English. Output only the transcript, nothing else. If there is no clear speech, output [no speech].",
+      [filePart]);
+    if (!transcript || transcript === "[no speech]") throw new Error("I couldn't hear any clear speech in that voice note.");
+    await sendText(env, chatId, `🎤 "${transcript}"`);
+    const userText = (caption ? caption + "\n" : "") + transcript;
+    return { userText, storedText: `[Voice note] ${userText}` };
+  }
+
+  // Photo, PDF or text file: pull out the content
+  let content = await geminiText(env,
+    "You read files for a personal assistant. Extract everything useful from this file: first one line saying what it is, " +
+    "then all readable text and details. Keep names, dates, amounts, numbers and addresses exactly as written. " +
+    "For long documents give the key points plus all important details. Never invent anything; write [unclear] where you can't read it.",
+    [filePart, { text: caption ? `He wrote with it: ${caption}` : "He sent this without a message." }],
+    180000);
+  if (!content) throw new Error("I couldn't read anything from that file.");
+  if (content.length > 12000) content = content.slice(0, 12000) + "\n...(rest cut off)";
+
+  const label = media.kind + (media.name ? `: ${media.name}` : "");
+  const userText = `${caption || "(He sent this without a message. Briefly say what it is and offer useful next steps.)"}\n\n` +
+    `[Zayaan sent a ${label}. Its content:]\n${content}`;
+  const short = content.length > 1500 ? content.slice(0, 1500) + "...(full content in recent data)" : content;
+  return {
+    userText,
+    storedText: `${caption || "(no message)"}\n[Sent a ${label}. Content:]\n${short}`,
+    extraLog: { tool: "file_content", args: { file: label }, result: { content } },
+  };
+}
+
+// ---------- Smarter memory ----------
+
+const MAX_FACTS = 150;
+
+async function autoMemory(env, chatId, userText, reply) {
+  try {
+    if (!userText || userText.replace(/\s+/g, "").length < 15) return;
+    const facts = (await env.DB.prepare("SELECT id, fact FROM facts ORDER BY id").all()).results;
+
+    const system = `You maintain long-term memory about Zayaan for his personal assistant.
+Existing facts (id: fact):
+${facts.map((f) => `${f.id}: ${f.fact}`).join("\n") || "(none)"}
+
+Look at the latest exchange and return lasting new facts about Zayaan, if any.
+Save: his preferences, people in his life and who they are to him, his work, projects, goals, routines, important dates.
+Do NOT save:
+- one-off tasks, reminders, plans for today, or anything already in the facts (even if worded differently)
+- things from emails, web results or files unless he says they are about him
+- passwords, ID numbers, bank or card numbers, health or medical details, money amounts or salary
+- your own guesses. Only what he clearly said.
+If he corrects a fact or says it changed, put the old fact's id in remove_ids and add the new version.
+Write each fact as a short sentence starting with "Zayaan" or naming the person. Most of the time return empty lists.`;
+    const schema = {
+      type: "object",
+      properties: {
+        add: { type: "array", items: { type: "string" } },
+        remove_ids: { type: "array", items: { type: "integer" } },
+      },
+      required: ["add", "remove_ids"],
+    };
+    const res = await callGemini(env, system,
+      [{ role: "user", parts: [{ text: `Zayaan: ${userText.slice(0, 4000)}\n\nAssistant: ${(reply || "").slice(0, 2000)}` }] }],
+      60000, false, { responseMimeType: "application/json", responseSchema: schema });
+    const raw = (res.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("");
+    const out = JSON.parse(raw || "{}");
+
+    const known = new Set(facts.map((f) => f.fact.toLowerCase().trim()));
+    const validIds = new Set(facts.map((f) => f.id));
+    const removed = [];
+    for (const id of out.remove_ids || []) {
+      if (!validIds.has(id)) continue;
+      const f = facts.find((x) => x.id === id);
+      await env.DB.prepare("DELETE FROM facts WHERE id = ?").bind(id).run();
+      removed.push(f.fact);
+    }
+    const added = [];
+    let count = facts.length - removed.length;
+    for (const fact of out.add || []) {
+      const clean = String(fact).trim();
+      if (!clean || known.has(clean.toLowerCase()) || count >= MAX_FACTS) continue;
+      await env.DB.prepare("INSERT INTO facts (fact) VALUES (?)").bind(clean).run();
+      known.add(clean.toLowerCase());
+      added.push(clean);
+      count++;
+    }
+
+    if (added.length || removed.length) {
+      let note = "";
+      if (added.length) note += "🧠 Remembered: " + added.join(" · ");
+      if (removed.length) note += (note ? "\n" : "") + "🧠 Forgot (outdated): " + removed.join(" · ");
+      note += "\n(/memory to see everything I know)";
+      await tg(env, "sendMessage", { chat_id: chatId, text: note, disable_notification: true });
+    }
+  } catch (e) {
+    console.log("autoMemory skipped:", e.message);
   }
 }
 
