@@ -329,6 +329,10 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
   const digest = (await getSetting(env, "job_digest")) || DEFAULT_JOB_DIGEST;
   const systemPrompt = buildSystemPrompt(facts, recentData, briefTime, jobPrefs, digest);
   const toolLog = opts.extraLog ? [opts.extraLog] : [];
+  const receipts = [];      // proof lines written by the code, not the AI
+  const usedTools = new Set();
+  let forceReminder = false;
+  let checkedReminder = false;
   let finalText = null;
 
   for (let step = 0; step < 8; step++) {
@@ -340,7 +344,11 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
     }
     let data;
     try {
-      data = await callGemini(env, systemPrompt, contents, Math.min(timeLeft, 120000));
+      const toolConfig = forceReminder
+        ? { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["set_reminder", "list_reminders", "cancel_reminder"] } }
+        : null;
+      forceReminder = false;
+      data = await callGemini(env, systemPrompt, contents, Math.min(timeLeft, 120000), true, null, toolConfig);
     } catch (e) {
       if (e.name === "TimeoutError" || e.name === "AbortError") {
         finalText = "The AI took too long to answer. Please try again, or ask something more specific.";
@@ -356,6 +364,19 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
     const calls = content.parts.filter((p) => p.functionCall);
     if (calls.length === 0) {
       finalText = content.parts.map((p) => p.text || "").join("").trim();
+
+      // Safety check: he asked for a reminder, but the AI only talked about it
+      const reminderTools = ["set_reminder", "list_reminders", "cancel_reminder"];
+      if (!checkedReminder && REMINDER_INTENT.test(userText) &&
+          !reminderTools.some((t) => usedTools.has(t)) && !/[?？]\s*$/.test(finalText)) {
+        checkedReminder = true;
+        forceReminder = true;
+        finalText = null;
+        contents.push({ role: "user", parts: [{ text:
+          "[System check: no reminder tool was called, so no reminder exists yet. Call the correct reminder tool now. " +
+          "Use in_minutes for relative times.]" }] });
+        continue;
+      }
       break;
     }
 
@@ -369,12 +390,18 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
         result = { error: e.message };
       }
       if (DATA_TOOLS.includes(name) && !result.error) toolLog.push({ tool: name, args, result: compactForLog(name, result) });
+      if (!result.error) {
+        usedTools.add(name);
+        const receipt = receiptFor(name, args || {}, result);
+        if (receipt) receipts.push(receipt);
+      }
       responses.push({ functionResponse: { name, response: { result } } });
     }
     contents.push({ role: "user", parts: responses });
   }
 
   if (!finalText) finalText = "I got a bit stuck on that. Can you try again?";
+  if (receipts.length) finalText += "\n\n" + receipts.join("\n");
 
   await db.prepare("INSERT INTO messages (role, content) VALUES ('model', ?)").bind(finalText).run();
   await db.prepare(
@@ -436,7 +463,8 @@ function buildSystemPrompt(facts, recentData = [], briefTime = DEFAULT_BRIEF_TIM
 
   return `You are Zayaan's personal AI assistant, chatting with him on Telegram.
 Be friendly, clear and to the point. Use plain text only, no markdown symbols like * or #.
-Reply in the language Zayaan uses: English, Sinhala, or Singlish (Sinhala in English letters).
+Match Zayaan's language and script: if he writes or speaks in Sinhala script, reply in Sinhala script. If he uses Singlish (Sinhala in English letters), reply in Singlish. Otherwise reply in English.
+Actions only happen through tools. Never say you set, saved, added or did something unless you called the tool in this turn. The system adds a ✅/⏰ receipt line under your reply for each real action, so don't repeat those details at length.
 He can send voice notes (you get the transcript), photos and PDFs (you get their content as text). Use that content to do what he asks.
 Current date and time in Sri Lanka: ${now} (today is ${localNow().date}). All times are Sri Lanka time.
 
@@ -743,7 +771,7 @@ const TOOLS = [{
   ],
 }];
 
-async function callGemini(env, systemPrompt, contents, timeoutMs = 50000, useTools = true, generationConfig = null) {
+async function callGemini(env, systemPrompt, contents, timeoutMs = 50000, useTools = true, generationConfig = null, toolConfig = null) {
   const model = env.GEMINI_MODEL || "gemini-flash-latest";
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -759,6 +787,7 @@ async function callGemini(env, systemPrompt, contents, timeoutMs = 50000, useToo
         contents,
         ...(useTools ? { tools: TOOLS } : {}),
         ...(generationConfig ? { generationConfig } : {}),
+        ...(useTools && toolConfig ? { toolConfig } : {}),
       }),
     }
   );
@@ -1085,6 +1114,45 @@ Never invent anything. Only use the data given. Keep it short and easy to scan.`
     let saved = JSON.stringify({ question: "daily brief", data: logData });
     if (saved.length > 32000) saved = saved.slice(0, 32000) + "...(cut off)";
     await env.DB.prepare("INSERT INTO tool_log (content) VALUES (?)").bind(saved).run();
+  }
+}
+
+// ---------- Receipts and checks ----------
+
+// Words that mean "remind me" in English, Sinhala and Singlish
+const REMINDER_INTENT = /remind|reminder|alarm|මතක්\s*කර|මතක්\s*කරන්න|මතක්\s*කරලා|mathak\s*kara|mathak\s*karanna|mathak\s*karala/i;
+
+function receiptFor(name, args, r) {
+  switch (name) {
+    case "set_reminder":
+      return `⏰ Reminder set: ${r.when} - ${r.text}${r.repeat && r.repeat !== "none" ? " (" + r.repeat + ")" : ""}`;
+    case "cancel_reminder":
+      return r.cancelled ? `🗑 Reminder ${args.id} cancelled` : null;
+    case "add_task":
+      return `✅ Task added: ${args.title}${args.due ? " (due " + args.due + ")" : ""}`;
+    case "complete_task":
+      return r.completed ? `✅ Task ${args.id} marked done` : null;
+    case "delete_task":
+      return r.deleted ? `🗑 Task ${args.id} deleted` : null;
+    case "save_note":
+      return "📝 Note saved";
+    case "delete_note":
+      return r.deleted ? `🗑 Note ${args.id} deleted` : null;
+    case "save_fact":
+      return `🧠 Remembered: ${args.fact}`;
+    case "delete_fact":
+      return r.deleted ? `🧠 Forgot fact ${args.id}` : null;
+    case "draft_email":
+      return `📧 Draft saved in Gmail${r.subject ? ": " + r.subject : ""}`;
+    case "add_job":
+    case "update_job":
+      return `💼 Job ${r.id}: ${r.status}${r.follow_up_reminder ? " · follow-up reminder " + r.follow_up_reminder : ""}`;
+    case "set_daily_brief":
+      return `☀️ Daily brief: ${r.daily_brief}`;
+    case "set_job_digest":
+      return `💼 Job digest: ${r.job_digest}`;
+    default:
+      return null;
   }
 }
 
