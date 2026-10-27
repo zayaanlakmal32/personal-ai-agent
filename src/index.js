@@ -1,4 +1,4 @@
-// Personal AI Agent — Step 6: voice notes, photos/PDFs, smarter memory
+// Personal AI Agent — Step 6: voice notes, photos/PDFs, smarter memory, PDF creation
 // Includes memory, tasks, notes, Gmail, Calendar, queue, reminders, daily brief, web search, jobs
 
 const TZ = "Asia/Colombo";
@@ -147,7 +147,7 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
     if (text === "/start") {
       await sendText(env, chatId,
         "Hey Zayaan! I'm your personal agent.\n\n" +
-        "Just talk to me normally, or send voice notes, photos and PDFs. I can remember things, manage tasks and notes, set reminders, send a daily brief, read your Gmail, manage your Calendar, search the web and help with your job hunt.\n\n" +
+        "Just talk to me normally, or send voice notes, photos and PDFs. I can remember things, manage tasks and notes, set reminders, send a daily brief, read your Gmail, manage your Calendar, search the web, help with your job hunt, and make PDFs for you.\n\n" +
         "Commands:\n/tasks - open tasks\n/notes - recent notes\n/memory - what I know about you\n/forget - clear chat history\n" +
         "/reminders - upcoming reminders\n/brief - your daily brief now\n" +
         "/jobs - saved job matches\n/applications - jobs you applied to\n/scan_jobs - check job alert emails now\n" +
@@ -322,6 +322,10 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
     const last = contents[contents.length - 1];
     if (last && last.role === m.role) last.parts[0].text += "\n\n" + m.content;
     else contents.push({ role: m.role, parts: [{ text: m.content }] });
+  }
+  // If he used Sinhala letters, tell the AI directly to reply in Sinhala script
+  if (/[\u0D80-\u0DFF]/.test(userText)) {
+    contents[contents.length - 1].parts[0].text += "\n\n(Reply in Sinhala script, not Singlish.)";
   }
 
   const briefTime = (await getSetting(env, "brief_time")) || DEFAULT_BRIEF_TIME;
@@ -509,6 +513,11 @@ Reminders and daily brief:
 - Use list_reminders and cancel_reminder to show or remove them.
 - The daily brief is currently set to: ${briefTime === "off" ? "off" : briefTime}. Use set_daily_brief to change the time or turn it off.
 
+PDFs:
+- When he asks for a PDF or a document file of anything (a summary of our chat, saved jobs, notes, an email, research), call make_pdf.
+- Write the content in simple markdown: # and ## headings, - bullet points, 1. numbered lists, **bold**, and | tables |. Make it complete, well organised and accurate. Only use real information from the chat, tools or data.
+- Gather any data you need first (e.g. list_jobs, read_email, web_search), then call make_pdf. The PDF is sent to him directly.
+
 Web search:
 - Use web_search for anything current or that you aren't sure about: news, prices, companies, people, events, how-tos that may have changed.
 - Base the answer only on the results. End with a short "Sources:" list of the 1 to 3 most useful links.
@@ -682,6 +691,19 @@ const TOOLS = [{
       name: "cancel_reminder",
       description: "Cancel a reminder by its id.",
       parameters: { type: "object", properties: { id: { type: "integer" } }, required: ["id"] },
+    },
+    {
+      name: "make_pdf",
+      description: "Create a nicely formatted PDF and send it to Zayaan on Telegram.",
+      parameters: {
+        type: "object",
+        properties: {
+          title: { type: "string" },
+          content: { type: "string", description: "Full document body in simple markdown (#, ##, -, 1., **bold**, | tables |)" },
+          filename: { type: "string", description: "Short file name without .pdf, e.g. chat-summary" },
+        },
+        required: ["title", "content"],
+      },
     },
     {
       name: "web_search",
@@ -893,6 +915,8 @@ async function runTool(env, name, args, pending) {
       const r = await db.prepare("DELETE FROM reminders WHERE id = ?").bind(args.id).run();
       return { cancelled: r.meta.changes > 0 };
     }
+    case "make_pdf":
+      return await makePdf(env, args);
     case "web_search":
       return await webSearch(env, args.query, args.news);
     case "scan_job_emails":
@@ -1149,6 +1173,8 @@ function receiptFor(name, args, r) {
       return `💼 Job ${r.id}: ${r.status}${r.follow_up_reminder ? " · follow-up reminder " + r.follow_up_reminder : ""}`;
     case "set_daily_brief":
       return `☀️ Daily brief: ${r.daily_brief}`;
+    case "make_pdf":
+      return `📄 PDF sent: ${r.filename}`;
     case "set_job_digest":
       return `💼 Job digest: ${r.job_digest}`;
     default:
@@ -1305,6 +1331,145 @@ Write each fact as a short sentence starting with "Zayaan" or naming the person.
   } catch (e) {
     console.log("autoMemory skipped:", e.message);
   }
+}
+
+// ---------- PDF creation (Cloudflare Browser Run) ----------
+
+async function makePdf(env, args) {
+  if (!env.CF_ACCOUNT_ID || !env.CF_API_TOKEN) {
+    throw new Error("PDF making isn't set up yet. CF_ACCOUNT_ID or CF_API_TOKEN is missing in Cloudflare settings.");
+  }
+  const title = String(args.title || "Document").slice(0, 150);
+  let content = String(args.content || "");
+  if (content.length > 100000) content = content.slice(0, 100000) + "\n\n...(cut off)";
+  const filename = ((args.filename || title).toLowerCase().replace(/[^a-z0-9\u0D80-\u0DFF]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "document") + ".pdf";
+
+  const html = pdfHtml(title, markdownToHtml(content));
+  const pdf = await renderPdf(env, html);
+
+  const form = new FormData();
+  form.append("chat_id", String(env.ALLOWED_USER_ID));
+  form.append("caption", `📄 ${title}`.slice(0, 1000));
+  form.append("document", new Blob([pdf], { type: "application/pdf" }), filename);
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendDocument`, { method: "POST", body: form });
+  const out = await res.json().catch(() => ({}));
+  if (!out.ok) throw new Error("Telegram didn't accept the PDF: " + (out.description || res.status));
+
+  return { sent: true, filename, size_kb: Math.round(pdf.byteLength / 1024) };
+}
+
+async function renderPdf(env, html) {
+  const body = {
+    html,
+    gotoOptions: { waitUntil: "networkidle0", timeout: 30000 },
+    pdfOptions: {
+      format: "a4",
+      printBackground: true,
+      displayHeaderFooter: true,
+      headerTemplate: "<div></div>",
+      footerTemplate: '<div style="font-size:9px;color:#888;width:100%;text-align:center;">Page <span class="pageNumber"></span> of <span class="totalPages"></span></div>',
+      margin: { top: "50px", bottom: "60px", left: "45px", right: "45px" },
+    },
+  };
+  // "browser-run" is the current name; "browser-rendering" is the older path
+  let lastError = "";
+  for (const path of ["browser-run", "browser-rendering"]) {
+    const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/${path}/pdf`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.CF_API_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (res.ok && (res.headers.get("content-type") || "").includes("pdf")) return await res.arrayBuffer();
+    const text = await res.text().catch(() => "");
+    let msg = text.slice(0, 300);
+    try { msg = JSON.parse(text).errors?.map((e) => e.message).join("; ") || msg; } catch (e) { /* not JSON */ }
+    lastError = `${res.status} ${msg}`;
+    if (res.status === 401 || res.status === 403) throw new Error("Cloudflare refused the PDF request. Check CF_API_TOKEN has 'Browser Run - Edit' permission. (" + lastError + ")");
+    if (res.status === 429) throw new Error("PDF limit reached for now (free plan: 1 request per 10 seconds, 10 minutes a day). Try again shortly.");
+    if (res.status !== 404) break;
+  }
+  throw new Error("Couldn't create the PDF: " + lastError);
+}
+
+function pdfHtml(title, bodyHtml) {
+  const date = new Date().toLocaleDateString("en-GB", { timeZone: TZ, day: "numeric", month: "long", year: "numeric" });
+  return `<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;600;700&family=Noto+Sans+Sinhala:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  body { font-family: "Noto Sans", "Noto Sans Sinhala", Arial, sans-serif; color: #1f2328; font-size: 11.5pt; line-height: 1.55; margin: 0; }
+  .head { border-bottom: 3px solid #2563eb; padding-bottom: 10px; margin-bottom: 22px; }
+  .head h1 { font-size: 22pt; margin: 0 0 4px; color: #111827; }
+  .head .meta { color: #6b7280; font-size: 9.5pt; }
+  h1 { font-size: 17pt; color: #111827; margin: 22px 0 8px; }
+  h2 { font-size: 14pt; color: #1e3a8a; margin: 20px 0 6px; padding-bottom: 3px; border-bottom: 1px solid #e5e7eb; }
+  h3 { font-size: 12pt; color: #111827; margin: 16px 0 4px; }
+  p { margin: 6px 0; }
+  ul, ol { margin: 6px 0 6px 22px; padding: 0; }
+  li { margin: 3px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 10pt; }
+  th, td { border: 1px solid #d1d5db; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #eff6ff; }
+  tr:nth-child(even) td { background: #f9fafb; }
+  a { color: #2563eb; word-break: break-all; }
+  h1, h2, h3 { page-break-after: avoid; }
+  tr, li { page-break-inside: avoid; }
+</style></head><body>
+<div class="head"><h1>${escapeHtml(title)}</h1><div class="meta">Zayy's Assistant · ${date}</div></div>
+${bodyHtml}
+</body></html>`;
+}
+
+function markdownToHtml(md) {
+  const inline = (t) => escapeHtml(t)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*([^*\s][^*]*?)\*(?!\w)/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2">$1</a>')
+    .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2">$2</a>');
+
+  const out = [];
+  let list = null;        // "ul" or "ol"
+  let para = [];
+  let table = [];
+  const flushPara = () => { if (para.length) { out.push(`<p>${para.join("<br>")}</p>`); para = []; } };
+  const flushList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  const flushTable = () => {
+    if (!table.length) return;
+    const rows = table.filter((r) => !/^\|?\s*:?-{2,}/.test(r.replace(/\s/g, "").replace(/^\|/, "|")));
+    const cells = (r) => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => inline(c.trim()));
+    let h = "<table>";
+    rows.forEach((r, i) => {
+      const tag = i === 0 ? "th" : "td";
+      h += "<tr>" + cells(r).map((c) => `<${tag}>${c}</${tag}>`).join("") + "</tr>";
+    });
+    out.push(h + "</table>");
+    table = [];
+  };
+  const flushAll = () => { flushPara(); flushList(); flushTable(); };
+
+  for (const raw of md.replace(/\r/g, "").split("\n")) {
+    const line = raw.trimEnd();
+    if (/^\s*\|.*\|\s*$/.test(line)) { flushPara(); flushList(); table.push(line); continue; }
+    flushTable();
+    let m;
+    if (!line.trim()) { flushPara(); flushList(); continue; }
+    if ((m = line.match(/^(#{1,3})\s+(.*)$/))) {
+      flushAll();
+      out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`);
+    } else if ((m = line.match(/^\s*[-*•]\s+(.*)$/))) {
+      flushPara();
+      if (list !== "ul") { flushList(); out.push("<ul>"); list = "ul"; }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      flushPara();
+      if (list !== "ol") { flushList(); out.push("<ol>"); list = "ol"; }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else {
+      flushList();
+      para.push(inline(line.trim()));
+    }
+  }
+  flushAll();
+  return out.join("\n");
 }
 
 // ---------- Web search (Tavily) ----------

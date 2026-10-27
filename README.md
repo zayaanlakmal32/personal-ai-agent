@@ -7,6 +7,8 @@ A private AI assistant on Telegram that manages my email, calendar, reminders an
 - **Chat with memory:** remembers facts, tasks and notes between conversations, and automatically picks up lasting facts from chats
 - **Voice notes:** English, Sinhala or Singlish, shown as a transcript and then answered
 - **Photos and PDFs:** reads receipts, documents and screenshots, and acts on the caption
+- **Makes PDFs:** "send me a PDF of…" produces a formatted PDF, sent in the chat (Cloudflare Browser Run, Sinhala supported)
+- **Action receipts:** every real action adds a code-written ✅/⏰ line, so the AI can't fake it
 - **Gmail:** analyses up to 200 emails at once, reads, drafts, and sends only after I tap Confirm
 - **Google Calendar:** checks my schedule, and creates or deletes events only after I tap Confirm
 - **Reminders:** one-off, daily or weekly, delivered on time
@@ -51,6 +53,7 @@ Cron (every minute) → reminders, daily brief, weekly job digest
 | `GEMINI_API_KEY` | From aistudio.google.com |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google Cloud OAuth client (Web application) |
 | `TAVILY_API_KEY` | From tavily.com (free plan) |
+| `CF_ACCOUNT_ID` / `CF_API_TOKEN` | For PDFs: Cloudflare account ID, plus an API token with "Browser Run - Edit" permission |
 | `GEMINI_MODEL` | Optional, defaults to `gemini-flash-latest` |
 
 ### Bindings
@@ -90,4 +93,4 @@ Anything else is plain chat, for example "any important emails today?", "remind 
 3. Gmail + Calendar with confirm buttons, batch email fetching, and follow-up context
 4. Queue for long jobs, plus reminders and a daily brief (cron)
 5. Web search (Tavily), plus job scanning, scoring, tracking and weekly digest
-6. Voice notes, photo and PDF reading, and automatic long-term memory
+6. Voice notes, photo and PDF reading, automatic long-term memory, PDF creation, and action receipts
