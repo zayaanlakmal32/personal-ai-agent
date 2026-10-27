@@ -8,6 +8,9 @@ A private AI assistant on Telegram that manages my email, calendar, reminders an
 - **Voice notes:** English, Sinhala or Singlish, shown as a transcript and then answered
 - **Photos and PDFs:** reads receipts, documents and screenshots, and acts on the caption
 - **Makes PDFs:** "send me a PDF of…" produces a formatted PDF, sent in the chat (Cloudflare Browser Run, Sinhala supported)
+- **Images:** generates pictures from text (FLUX on Workers AI, free) and edits your photos or the last image it made
+- **Deep thinking:** hands complex questions to a stronger Gemini model
+- **Long chats:** older messages are summarised automatically, so context isn't lost
 - **Action receipts:** every real action adds a code-written ✅/⏰ line, so the AI can't fake it
 - **Gmail:** analyses up to 200 emails at once, reads, drafts, and sends only after I tap Confirm
 - **Google Calendar:** checks my schedule, and creates or deletes events only after I tap Confirm
@@ -53,12 +56,14 @@ Cron (every minute) → reminders, daily brief, weekly job digest
 | `GEMINI_API_KEY` | From aistudio.google.com |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | Google Cloud OAuth client (Web application) |
 | `TAVILY_API_KEY` | From tavily.com (free plan) |
+| `GEMINI_PRO_MODEL` | Optional, defaults to `gemini-pro-latest` (for deep thinking) |
 | `CF_ACCOUNT_ID` / `CF_API_TOKEN` | For PDFs: Cloudflare account ID, plus an API token with "Browser Run - Edit" permission |
 | `GEMINI_MODEL` | Optional, defaults to `gemini-flash-latest` |
 
 ### Bindings
 
 - **D1 database:** variable `DB`
+- **Workers AI:** variable `AI` (for images)
 - **Queue producer:** variable `JOBS` (queue `agent-jobs`)
 - **Queue consumer:** this Worker, with batch size 1, retries 0 and max concurrency 1
 - **Cron trigger:** `* * * * *`
@@ -94,3 +99,4 @@ Anything else is plain chat, for example "any important emails today?", "remind 
 4. Queue for long jobs, plus reminders and a daily brief (cron)
 5. Web search (Tavily), plus job scanning, scoring, tracking and weekly digest
 6. Voice notes, photo and PDF reading, automatic long-term memory, PDF creation, and action receipts
+7. Image generation and editing, deep thinking, and long-chat summaries

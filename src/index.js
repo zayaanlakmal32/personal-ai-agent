@@ -1,4 +1,4 @@
-// Personal AI Agent — Step 6: voice notes, photos/PDFs, smarter memory, PDF creation
+// Personal AI Agent — Step 7: image generation + editing, deep thinking, long-chat memory
 // Includes memory, tasks, notes, Gmail, Calendar, queue, reminders, daily brief, web search, jobs
 
 const TZ = "Asia/Colombo";
@@ -157,6 +157,8 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
 
     if (text === "/forget") {
       await env.DB.prepare("DELETE FROM messages").run();
+      await deleteSetting(env, "chat_summary");
+      await deleteSetting(env, "summarized_upto");
       await sendText(env, chatId, "Chat history cleared. Your saved facts, tasks and notes are kept.");
       return;
     }
@@ -278,6 +280,7 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
     const opts = {};
     try {
       // Voice notes, photos and files become text first
+      if (media?.edit_file_id) await setSetting(env, "last_photo", media.edit_file_id);
       if (media) {
         const input = await mediaToText(env, chatId, media, (msg.caption || "").trim());
         userText = input.userText;
@@ -293,6 +296,7 @@ async function handleUpdate(update, env, origin, timeLimitMs = 50000) {
 
     // Afterwards, quietly pick up lasting facts from this chat
     await autoMemory(env, chatId, opts.storedText || userText, reply);
+    await summarizeOldChat(env);
   } catch (err) {
     await sendText(env, chatId, "Something went wrong: " + err.message);
   }
@@ -331,7 +335,9 @@ async function runAgent(env, userText, pending, timeLimitMs = 50000, opts = {}) 
   const briefTime = (await getSetting(env, "brief_time")) || DEFAULT_BRIEF_TIME;
   const jobPrefs = (await getSetting(env, "job_preferences")) || DEFAULT_JOB_PREFS;
   const digest = (await getSetting(env, "job_digest")) || DEFAULT_JOB_DIGEST;
-  const systemPrompt = buildSystemPrompt(facts, recentData, briefTime, jobPrefs, digest);
+  const chatSummary = await getSetting(env, "chat_summary");
+  const systemPrompt = buildSystemPrompt(facts, recentData, briefTime, jobPrefs, digest) +
+    (chatSummary ? `\n\nSummary of your earlier conversation with Zayaan (older than the messages you can see):\n${chatSummary}` : "");
   const toolLog = opts.extraLog ? [opts.extraLog] : [];
   const receipts = [];      // proof lines written by the code, not the AI
   const usedTools = new Set();
@@ -513,6 +519,15 @@ Reminders and daily brief:
 - Use list_reminders and cancel_reminder to show or remove them.
 - The daily brief is currently set to: ${briefTime === "off" ? "off" : briefTime}. Use set_daily_brief to change the time or turn it off.
 
+Images:
+- Use generate_image when he asks for a picture, image, drawing, logo idea, poster, etc. Write a detailed English prompt (subject, style, lighting, colours, composition), even if he asked in Sinhala.
+- Use edit_image to change the last photo he sent or the last image you made ("make it darker", "put this in anime style", "change the background to a beach").
+- For "try again" or "another one", call generate_image again with a varied prompt.
+- The image is sent to him directly. Afterwards just add a short line, no need to describe it at length.
+
+Thinking hard:
+- For complex questions (business plans, strategy, careful comparisons, tricky maths or code, important decisions), call deep_think with the question and all relevant context, then pass its answer on in plain text. Don't use it for simple things.
+
 PDFs:
 - When he asks for a PDF or a document file of anything (a summary of our chat, saved jobs, notes, an email, research), call make_pdf.
 - Write the content in simple markdown: # and ## headings, - bullet points, 1. numbered lists, **bold**, and | tables |. Make it complete, well organised and accurate. Only use real information from the chat, tools or data.
@@ -691,6 +706,36 @@ const TOOLS = [{
       name: "cancel_reminder",
       description: "Cancel a reminder by its id.",
       parameters: { type: "object", properties: { id: { type: "integer" } }, required: ["id"] },
+    },
+    {
+      name: "generate_image",
+      description: "Create an image from a text description and send it to Zayaan.",
+      parameters: {
+        type: "object",
+        properties: {
+          prompt: { type: "string", description: "Detailed English description of the image" },
+          shape: { type: "string", enum: ["square", "landscape", "portrait"], description: "Default square" },
+        },
+        required: ["prompt"],
+      },
+    },
+    {
+      name: "edit_image",
+      description: "Edit the last photo Zayaan sent, or the last image you made, and send the result.",
+      parameters: {
+        type: "object",
+        properties: { instruction: { type: "string", description: "What to change, in English" } },
+        required: ["instruction"],
+      },
+    },
+    {
+      name: "deep_think",
+      description: "Ask a stronger, slower AI model to think carefully about a complex question. Include all needed context.",
+      parameters: {
+        type: "object",
+        properties: { question: { type: "string" }, context: { type: "string" } },
+        required: ["question"],
+      },
     },
     {
       name: "make_pdf",
@@ -917,6 +962,12 @@ async function runTool(env, name, args, pending) {
     }
     case "make_pdf":
       return await makePdf(env, args);
+    case "generate_image":
+      return await generateImage(env, args);
+    case "edit_image":
+      return await editImage(env, args);
+    case "deep_think":
+      return await deepThink(env, args);
     case "web_search":
       return await webSearch(env, args.query, args.news);
     case "scan_job_emails":
@@ -1175,6 +1226,12 @@ function receiptFor(name, args, r) {
       return `☀️ Daily brief: ${r.daily_brief}`;
     case "make_pdf":
       return `📄 PDF sent: ${r.filename}`;
+    case "generate_image":
+      return "🎨 Image sent";
+    case "edit_image":
+      return "🖌 Edited image sent";
+    case "deep_think":
+      return r.unavailable ? "⚠️ Stronger model limit reached today, answered normally" : `🧠 Thought it through with ${r.model}`;
     case "set_job_digest":
       return `💼 Job digest: ${r.job_digest}`;
     default:
@@ -1190,8 +1247,8 @@ function getMedia(msg) {
   if (msg.voice) return { kind: "voice", file_id: msg.voice.file_id, mime: msg.voice.mime_type || "audio/ogg", size: msg.voice.file_size };
   if (msg.audio) return { kind: "voice", file_id: msg.audio.file_id, mime: msg.audio.mime_type || "audio/mpeg", size: msg.audio.file_size, name: msg.audio.file_name };
   if (msg.photo?.length) {
-    const p = msg.photo[msg.photo.length - 1]; // largest size
-    return { kind: "photo", file_id: p.file_id, mime: "image/jpeg", size: p.file_size };
+    const p = msg.photo[msg.photo.length - 1]; // largest size, for reading
+    return { kind: "photo", file_id: p.file_id, mime: "image/jpeg", size: p.file_size, edit_file_id: editableSize(msg.photo) };
   }
   if (msg.document) {
     const d = msg.document;
@@ -1330,6 +1387,150 @@ Write each fact as a short sentence starting with "Zayaan" or naming the person.
     }
   } catch (e) {
     console.log("autoMemory skipped:", e.message);
+  }
+}
+
+// ---------- Images (Cloudflare Workers AI) ----------
+
+const IMAGE_MODEL = "@cf/black-forest-labs/flux-2-klein-4b";
+const IMAGE_FALLBACK_MODEL = "@cf/black-forest-labs/flux-1-schnell";
+const SHAPES = { square: [1024, 1024], landscape: [1280, 768], portrait: [768, 1280] };
+
+// Editing needs a photo under 512x512, so pick the biggest Telegram size that fits
+function editableSize(sizes) {
+  const fits = sizes.filter((p) => (p.width || 0) < 512 && (p.height || 0) < 512);
+  return (fits.length ? fits[fits.length - 1] : sizes[0]).file_id;
+}
+
+async function aiImageToBytes(resp) {
+  if (!resp) throw new Error("The image model returned nothing.");
+  if (resp instanceof ReadableStream) return new Uint8Array(await new Response(resp).arrayBuffer());
+  if (resp instanceof ArrayBuffer) return new Uint8Array(resp);
+  if (resp instanceof Uint8Array) return resp;
+  const b64 = resp.image || resp.result?.image;
+  if (typeof b64 === "string") {
+    const bin = atob(b64.replace(/^data:image\/\w+;base64,/, ""));
+    return Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  }
+  throw new Error("Unexpected image response from the model.");
+}
+
+async function runImageModel(env, prompt, width, height, inputImage) {
+  if (!env.AI) throw new Error("Image making isn't set up yet. Add a Workers AI binding named AI in Cloudflare.");
+  const form = new FormData();
+  form.append("prompt", prompt);
+  form.append("width", String(width));
+  form.append("height", String(height));
+  if (inputImage) form.append("input_image_0", new Blob([inputImage], { type: "image/jpeg" }));
+  const req = new Response(form);
+  try {
+    const resp = await env.AI.run(IMAGE_MODEL, {
+      multipart: { body: req.body, contentType: req.headers.get("content-type") },
+    });
+    return await aiImageToBytes(resp);
+  } catch (e) {
+    if (inputImage) throw e; // no fallback for editing
+    // Fallback: older, simpler model for text-to-image
+    const resp = await env.AI.run(IMAGE_FALLBACK_MODEL, { prompt, steps: 4 });
+    return await aiImageToBytes(resp);
+  }
+}
+
+async function sendPhotoBytes(env, bytes, caption) {
+  const form = new FormData();
+  form.append("chat_id", String(env.ALLOWED_USER_ID));
+  if (caption) form.append("caption", caption.slice(0, 1000));
+  form.append("photo", new Blob([bytes], { type: "image/jpeg" }), "image.jpg");
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_TOKEN}/sendPhoto`, { method: "POST", body: form });
+  const out = await res.json().catch(() => ({}));
+  if (!out.ok) throw new Error("Telegram didn't accept the image: " + (out.description || res.status));
+  // Remember it, so "make it darker" can edit this image next
+  if (out.result?.photo?.length) await setSetting(env, "last_photo", editableSize(out.result.photo));
+}
+
+function aiLimitError(e) {
+  const m = String(e.message || e);
+  if (/neuron|limit|quota|429|capacity/i.test(m)) {
+    return new Error("Today's free image limit is used up (it resets at 5:30am Sri Lanka time). Try again tomorrow.");
+  }
+  return e;
+}
+
+async function generateImage(env, args) {
+  const [w, h] = SHAPES[args.shape] || SHAPES.square;
+  try {
+    const bytes = await runImageModel(env, args.prompt, w, h, null);
+    await sendPhotoBytes(env, bytes, null);
+  } catch (e) {
+    throw aiLimitError(e);
+  }
+  return { sent: true, prompt: args.prompt };
+}
+
+async function editImage(env, args) {
+  const fileId = await getSetting(env, "last_photo");
+  if (!fileId) throw new Error("There's no photo to edit yet. Ask Zayaan to send one first.");
+  const b64 = await downloadTelegramFile(env, { file_id: fileId });
+  const bin = atob(b64);
+  const input = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  try {
+    const bytes = await runImageModel(env,
+      `Edit image 0: ${args.instruction}. Keep everything else the same as image 0.`, 1024, 1024, input);
+    await sendPhotoBytes(env, bytes, null);
+  } catch (e) {
+    throw aiLimitError(e);
+  }
+  return { sent: true, instruction: args.instruction };
+}
+
+// ---------- Deep thinking (stronger Gemini model) ----------
+
+async function deepThink(env, args) {
+  const model = env.GEMINI_PRO_MODEL || "gemini-pro-latest";
+  const system = "You are a careful expert advisor helping Zayaan, an operations manager in Colombo, Sri Lanka. " +
+    "Think the problem through properly, consider trade-offs and risks, and give a clear, practical answer with concrete steps. " +
+    "Be honest about uncertainty. Plain text, no markdown symbols.";
+  const text = `${args.context ? "Context:\n" + args.context + "\n\n" : ""}Question:\n${args.question}`;
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: "POST",
+    signal: AbortSignal.timeout(180000),
+    headers: { "content-type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+    body: JSON.stringify({ system_instruction: { parts: [{ text: system }] }, contents: [{ role: "user", parts: [{ text }] }] }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 429) {
+      return { model, unavailable: true, note: "The stronger model's free daily limit is used up. Answer the question yourself as well as you can, and mention that." };
+    }
+    throw new Error(data.error?.message || `Gemini error ${res.status}`);
+  }
+  const answer = (data.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || "").join("").trim();
+  return { model, answer: answer.slice(0, 15000) };
+}
+
+// ---------- Long chats: summarise older messages ----------
+
+async function summarizeOldChat(env) {
+  try {
+    const upto = Number((await getSetting(env, "summarized_upto")) || 0);
+    // Messages older than the 20 the AI can see, and not yet summarised
+    const { results } = await env.DB.prepare(
+      "SELECT id, role, content FROM messages WHERE id > ? AND id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT 20) ORDER BY id"
+    ).bind(upto).all();
+    if (results.length < 10) return; // wait until there's a decent chunk
+
+    const old = (await getSetting(env, "chat_summary")) || "";
+    const transcript = results.map((m) => `${m.role === "user" ? "Zayaan" : "Assistant"}: ${m.content.slice(0, 1500)}`).join("\n");
+    const system = "You keep a running summary of a long chat between Zayaan and his assistant. Merge the existing summary " +
+      "with the new messages. Keep topics discussed, decisions, open questions, important details and numbers. Drop small talk. " +
+      "Write short bullet points, at most 2000 characters. Never invent anything.";
+    const summary = await geminiText(env, system,
+      [{ text: `Existing summary:\n${old || "(none)"}\n\nNew messages:\n${transcript}` }], 60000);
+    if (!summary) return;
+    await setSetting(env, "chat_summary", summary.slice(0, 2500));
+    await setSetting(env, "summarized_upto", results[results.length - 1].id);
+  } catch (e) {
+    console.log("summary skipped:", e.message);
   }
 }
 
