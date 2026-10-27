@@ -1,0 +1,24 @@
+# Optional: only needed if you deploy with the Wrangler CLI instead of the dashboard.
+# Keys go in Cloudflare secrets (wrangler secret put NAME), never in this file.
+
+name = "personal-agent"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "personal-agent-db"
+database_id = "<your-d1-database-id>"
+
+[[queues.producers]]
+binding = "JOBS"
+queue = "agent-jobs"
+
+[[queues.consumers]]
+queue = "agent-jobs"
+max_batch_size = 1
+max_retries = 0
+max_concurrency = 1
+
+[triggers]
+crons = ["* * * * *"]
